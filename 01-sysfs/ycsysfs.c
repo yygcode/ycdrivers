@@ -1,32 +1,61 @@
 /*
- *
+ * abbr.	ys: ycsysfs
  */
 
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
+#include <linux/sysfs.h>
 
 /* ys: ycsysfs */
-static struct class *ys_class;
 
 #define YS_NAME	"ycsysfs"
 
+static struct class *ys_class;
+
+ssize_t ys_authors_show(struct class *class, struct class_attribute *attr,
+			char *buf)
+{
+	return sprintf(buf, "yanyg <yygcode@gmail.com>\n");
+}
+
+static struct class_attribute ys_authors =
+{
+	{ "author", S_IRUGO},	/* attr */
+	ys_authors_show,
+	NULL,
+};
+
 static int __init ycsysfs_init(void)
 {
+	int err;
+
 	ys_class = class_create(THIS_MODULE, YS_NAME);
 
 	if (IS_ERR(ys_class)) {
-		printk(KERN_ERR "ycsysfs: class_create fail");
+		printk(KERN_ERR "ycsysfs: class_create fail\n");
 		return PTR_ERR(ys_class);
 	}
 
-	printk(KERN_INFO "ycsysfs: initialize");
+	/* /sys/class/ycsysfs/author */
+	if ((err = class_create_file(ys_class, &ys_authors))) {
+		printk(KERN_ERR "ycsysfs: sysfs_create_file fail\n");
+		goto err_out_sysfs_create_file_authors;
+	}
+
+	printk(KERN_INFO "ycsysfs: initialize\n");
 
 	return 0;
+
+err_out_sysfs_create_file_authors:
+	class_destroy(ys_class);
+
+	return err;
 }
 
 static void __exit ycsysfs_exit(void)
 {
+	class_remove_file(ys_class, &ys_authors);
 	class_destroy(ys_class);
 	printk(KERN_INFO "ycsysfs: destroy");
 }
