@@ -1,4 +1,5 @@
 /*
+ * ycsysfs - demo sysfs interface
  * abbr.	ys: ycsysfs
  */
 
@@ -13,18 +14,13 @@
 
 static struct class *ys_class;
 
-ssize_t ys_authors_show(struct class *class, struct class_attribute *attr,
-			char *buf)
+static ssize_t
+authors_show(struct class *class, struct class_attribute *attr, char *buf)
 {
 	return sprintf(buf, "yanyg <yygcode@gmail.com>\n");
 }
 
-static struct class_attribute ys_authors =
-{
-	{ "author", S_IRUGO},	/* attr */
-	ys_authors_show,
-	NULL,
-};
+CLASS_ATTR(authors, S_IRUGO, authors_show, NULL);
 
 static int __init ycsysfs_init(void)
 {
@@ -38,7 +34,7 @@ static int __init ycsysfs_init(void)
 	}
 
 	/* /sys/class/ycsysfs/author */
-	if ((err = class_create_file(ys_class, &ys_authors))) {
+	if ((err = class_create_file(ys_class, &class_attr_authors))) {
 		printk(KERN_ERR "ycsysfs: sysfs_create_file fail\n");
 		goto err_out_sysfs_create_file_authors;
 	}
@@ -55,7 +51,7 @@ err_out_sysfs_create_file_authors:
 
 static void __exit ycsysfs_exit(void)
 {
-	class_remove_file(ys_class, &ys_authors);
+	class_remove_file(ys_class, &class_attr_authors);
 	class_destroy(ys_class);
 	printk(KERN_INFO "ycsysfs: destroy");
 }

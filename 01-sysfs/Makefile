@@ -9,4 +9,4 @@ default:
 endif
 
 clean:
-	@rm -fr *.o *.ko *.mod.* modules.* Module.*
+	@rm -fr *.o *.ko *.mod.* modules.* Module.* .*.cmd .tmp_versions
