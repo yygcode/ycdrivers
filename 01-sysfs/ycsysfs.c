@@ -12,6 +12,8 @@
 
 #define YS_NAME	"ycsysfs"
 
+static struct kobject *kobj;
+
 static struct class *ys_class;
 static struct attribute ys_attr1 = {
 	.name	= "attr1",
@@ -72,7 +74,12 @@ static int __init ycsysfs_init(void)
 		goto err_out_sysfs_create_file_attr1;
 	}
 
-	if ((err = sysfs_create_group(ys_class->dev_kobj, &ys_attrg1))) {
+	if (!(kobj = kobject_create_and_add("yckobj", NULL))) {
+		printk(KERN_ERR "ycsysfs: kobj create fail\n");
+		goto err_out_kobj;
+	}
+
+	if ((err = sysfs_create_group(kobj, &ys_attrg1))) {
 		printk(KERN_ERR "ycsysfs: sysfs_create_group attrg1 fail\n");
 		goto err_out_sysfs_create_group_attrg1;
 	}
@@ -82,6 +89,8 @@ static int __init ycsysfs_init(void)
 	return 0;
 
 err_out_sysfs_create_group_attrg1:
+	kobject_put(kobj);
+err_out_kobj:
 	sysfs_remove_file(ys_class->dev_kobj, &ys_attr1);
 err_out_sysfs_create_file_attr1:
 	class_remove_file(ys_class, &class_attr_string.attr);
@@ -95,7 +104,8 @@ err_out_class_create_file_authors:
 
 static void __exit ycsysfs_exit(void)
 {
-	sysfs_remove_group(ys_class->dev_kobj, &ys_attrg1);
+	sysfs_remove_group(kobj, &ys_attrg1);
+	kobject_put(kobj);
 	sysfs_remove_file(ys_class->dev_kobj, &ys_attr1);
 	class_remove_file(ys_class, &class_attr_string.attr);
 	class_remove_file(ys_class, &class_attr_authors);
