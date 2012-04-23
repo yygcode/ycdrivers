@@ -13,6 +13,28 @@
 #define YS_NAME	"ycsysfs"
 
 static struct class *ys_class;
+static struct attribute ys_attr1 = {
+	.name	= "attr1",
+	.mode	= S_IRUGO,
+};
+static struct attribute g1_attr1 = {
+	.name	= "g1_attr1",
+	.mode	= S_IRUGO,
+};
+static struct attribute g1_attr2 = {
+	.name	= "g1_attr2",
+	.mode	= S_IRUGO,
+};
+static struct attribute *ys_g1_attr[] = {
+	&g1_attr1,
+	&g1_attr2,
+	NULL,
+};
+
+static struct attribute_group ys_attrg1 = {
+	.name = "attrg1",
+	.attrs = ys_g1_attr,
+};
 
 static ssize_t
 authors_show(struct class *class, struct class_attribute *attr, char *buf)
@@ -36,22 +58,36 @@ static int __init ycsysfs_init(void)
 
 	/* /sys/class/ycsysfs/author */
 	if ((err = class_create_file(ys_class, &class_attr_authors))) {
-		printk(KERN_ERR "ycsysfs: sysfs_create_file author fail\n");
-		goto err_out_sysfs_create_file_authors;
+		printk(KERN_ERR "ycsysfs: class_create_file author fail\n");
+		goto err_out_class_create_file_authors;
 	}
 
 	if ((err = class_create_file(ys_class, &class_attr_string.attr))) {
-		printk(KERN_ERR "ycsysfs: sysfs_create_file string fail\n");
-		goto err_out_sysfs_create_file_string;
+		printk(KERN_ERR "ycsysfs: class_create_file string fail\n");
+		goto err_out_class_create_file_string;
+	}
+
+	if ((err = sysfs_create_file(ys_class->dev_kobj, &ys_attr1))) {
+		printk(KERN_ERR "ycsysfs: sysfs_create_file attr1 fail\n");
+		goto err_out_sysfs_create_file_attr1;
+	}
+
+	if ((err = sysfs_create_group(ys_class->dev_kobj, &ys_attrg1))) {
+		printk(KERN_ERR "ycsysfs: sysfs_create_group attrg1 fail\n");
+		goto err_out_sysfs_create_group_attrg1;
 	}
 
 	printk(KERN_INFO "ycsysfs: initialize\n");
 
 	return 0;
 
-err_out_sysfs_create_file_string:
+err_out_sysfs_create_group_attrg1:
+	sysfs_remove_file(ys_class->dev_kobj, &ys_attr1);
+err_out_sysfs_create_file_attr1:
+	class_remove_file(ys_class, &class_attr_string.attr);
+err_out_class_create_file_string:
 	class_remove_file(ys_class, &class_attr_authors);
-err_out_sysfs_create_file_authors:
+err_out_class_create_file_authors:
 	class_destroy(ys_class);
 
 	return err;
@@ -59,6 +95,8 @@ err_out_sysfs_create_file_authors:
 
 static void __exit ycsysfs_exit(void)
 {
+	sysfs_remove_group(ys_class->dev_kobj, &ys_attrg1);
+	sysfs_remove_file(ys_class->dev_kobj, &ys_attr1);
 	class_remove_file(ys_class, &class_attr_string.attr);
 	class_remove_file(ys_class, &class_attr_authors);
 	class_destroy(ys_class);

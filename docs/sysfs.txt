@@ -1,0 +1,22 @@
+* sysfs describes the functions among the concepts:
+    Kernel Objects (Directories)
+    Object Attributes (Regular Files)
+    Object Relationships (Symbolic Links)
+
+* sysfs was originally called ddfs (Device Driver FileSystem) and was written
+  to debug the new driver model as it was being written in 2.4 version. And
+  it was named to driverfs in 2.5 version.
+
+* configuration
+  sysfs is compiled into the kernel by default. It is dependent on the
+  configuration option CONFIG_SYSFS. CONFIG_SYSFS is only visible if the
+  CONFIG_EMBEDDED option is set.
+
+* Licensing
+  GPL v2.
+sysfs_create_file - create an attribute file for an opject
+  @file: fs/sysfs.c
+  @paras: kobj - kobject we are creating for
+          attr - attribute descriptor
+  @returns: 0 for success
+
