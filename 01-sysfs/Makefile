@@ -1,4 +1,5 @@
 ifneq ($(KERNELRELEASE),)
+	ycsysfs-objs := sysfs.o kobject.o
 	obj-m := ycsysfs.o
 else
 	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
