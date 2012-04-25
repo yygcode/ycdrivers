@@ -38,7 +38,6 @@ static struct charsimple_cdev *charsimple_devices;
 
 static char *charsimple_devnode(struct device *dev, mode_t *mode)
 {
-	*mode = S_IRUGO;
 	return kasprintf(GFP_KERNEL, "yc/%s", dev_name(dev));
 }
 
@@ -100,6 +99,8 @@ static int __init charsimple_init(void)
 			      "charsimple%d", i);
 	}
 
+	printk(KERN_INFO "yccharsimple initialized\n");
+
 	return 0;
 
 err_out_cdev_add:
@@ -128,6 +129,8 @@ static void __exit charsimple_exit(void)
 	class_destroy(charsimple_class);
 	kfree(charsimple_devices);
 	unregister_chrdev_region(MKDEV(major, minor), devnum);
+
+	printk(KERN_INFO "yccharsimple destroyed\n");
 }
 
 module_init(charsimple_init);
