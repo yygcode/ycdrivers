@@ -1,7 +1,7 @@
 /*
- * filename
+ * charsimple.c
  *
- * description
+ * character device driver demo
  *
  */
 
@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #define YC_CHARSIMPLE_NAME "yc-charsimple"
 static int major;
@@ -26,20 +27,98 @@ static unsigned int devnum = 4;
 module_param(devnum, int, S_IRUGO);
 MODULE_PARM_DESC(devnum, "number of devices");
 
-static struct class *charsimple_class;
-static const struct file_operations charsimple_fops = {
-	.owner = THIS_MODULE,
-};
 
+static struct class *charsimple_class;
 struct  charsimple_cdev {
 	struct cdev cdev;
 };
+
 static struct charsimple_cdev *charsimple_devices;
 
 static char *charsimple_devnode(struct device *dev, mode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "yc/%s", dev_name(dev));
 }
+
+static int charsimple_open(struct inode *inode, struct file *file)
+{
+	struct charsimple_cdev *dev = container_of(inode->i_cdev,
+						   struct charsimple_cdev,
+						   cdev);
+
+	file->private_data = dev;
+
+	return 0;
+}
+
+static int charsimple_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static loff_t charsimple_llseek(struct file *file, loff_t f_pos, int whence)
+{
+	switch(whence) {
+	case 0:
+		break;
+
+	case 1:
+		f_pos += file->f_pos;
+		break;
+
+	case 2:
+		f_pos += sizeof("charsimple\n");
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	if (f_pos < 0)
+		return -EINVAL;
+
+	file->f_pos = f_pos;
+
+	return f_pos;
+}
+
+static ssize_t charsimple_read(struct file *file, char __user *buf,
+			       size_t count, loff_t *f_pos)
+{
+	char *val = "charsimple\n";
+	size_t n = sizeof("charsimple\n");
+
+	BUG_ON(*f_pos < 0);
+
+	if (*f_pos >= n)
+		return 0;
+
+	n -= *f_pos;
+	if (count > n)
+		count = n;
+
+	if (copy_to_user(buf, val + *f_pos, count))
+		return -EFAULT;
+
+	*f_pos += count;
+
+	return count;
+}
+
+static ssize_t charsimple_write(struct file *file, const char __user *buf,
+				size_t count, loff_t *loff)
+{
+	return -EINVAL;
+}
+
+static const struct file_operations charsimple_fops = {
+	.owner		= THIS_MODULE,
+	.open		= charsimple_open,
+	.release	= charsimple_release,
+	.llseek		= charsimple_llseek,
+	.read		= charsimple_read,
+	.write		= charsimple_write,
+};
 
 static int __init charsimple_init(void)
 {
