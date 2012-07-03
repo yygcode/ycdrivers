@@ -20,6 +20,32 @@ static struct kset_uevent_ops yc_uevent_ops = {
 
 static struct kset *yc_kset;
 
+struct yc_attribute {
+	struct attribute attr;
+	ssize_t (*show)(struct kobject *kobj, struct yc_attribute *attr, char *buf);
+};
+
+static ssize_t yc_attr_show(struct kobject *kobj, struct attribute *attr, char*buf)
+{
+	//struct yc_attribute *yc_attr = to_yc_attr(attr);
+	return 0;
+}
+
+static ssize_t yc_attr_store(struct kobject *kobj, struct attribute *attr,
+			     const char *buf, size_t count)
+{
+	return 0;
+}
+
+static struct sysfs_ops yc_sysfs_ops = {
+	.show = yc_attr_show,
+	.store = yc_attr_store,
+};
+
+static struct kobj_type yc_ktype = {
+	//.sysfs_ops = yc_sysfs_ops,
+};
+
 static ssize_t yckset_store(struct kobject *kobj, struct kobj_attribute *attr,
 			    const char *buf, size_t count);
 

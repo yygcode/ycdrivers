@@ -10,26 +10,34 @@
 #include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/blkdev.h>
+#include <linux/kdev_t.h>
+#include <linux/types.h>
 
 #define NAME	"blocksimple"
 
-static int major;
-module_param(major, int, S_IRUGO);
+static uint major;
+static uint max_part = 16;
+static uint nr_bs;
+static uint size_bs;
+
+module_param(major, uint, S_IRUGO);
 MODULE_PARM_DESC(major, "blocksimple device major number");
+module_param(max_part, uint, S_IRUGO);
+MODULE_PARM_DESC(partinum, "maximum partitions number per blocksimple device");
+module_param(nr_bs, uint, S_IRUGO);
+MODULE_PARM_DESC(nr_bs, "maximum number of blocksimple devices");
+module_param(size_bs, uint, S_IRUGO);
+MODULE_PARM_DESC(size_bs, "size of each blocksimple device in kbytes");
 
-static int partinum = 16;
-module_param(partinum, int, S_IRUGO);
-MODULE_PARM_DESC(partinum, "max partitions number per blocksimple device");
+static uint part_shift;
 
-static unsigned int devnum = 4;
-module_param(devnum, uint, S_IRUGO);
-MODULE_PARM_DESC(devnum, "number of blocksimple devices");
-
-struct blocksimple_device {
-	int number;
+struct bsd_device {
 	struct request_queue	*queue;
 	struct gendisk		*disk;
 	struct list_head	list;
+
+	spinlock_t		lock;
+	struct radix_tree_root	pages;
 };
 
 static const struct block_device_operations bsd_fops = {
@@ -39,49 +47,92 @@ static const struct block_device_operations bsd_fops = {
 static LIST_HEAD(blocksimple_devices);
 static DEFINE_MUTEX(blocksimple_devices_mutex);
 
+static void bsd_free_pages(struct bsd_device *bsd)
+{
+}
+
 static int bsd_make_request(struct request_queue *q, struct bio *bio)
 {
-	bio_endio(bio, 0);
+	struct block_device *bdev = bio->bi_bdev;
+	//struct bsd_device *bsdev = bdev->bd_disk->private_data;
+
+	int rw;
+	struct bio_vec *bvec;
+	sector_t sector;
+	int i;
+	int err = -EIO;
+
+	sector = bio->bi_sector;
+	if (sector + (bio->bi_size >> 9) > get_capacity(bdev->bd_disk))
+		goto out;
+
+	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
+		err = 0;
+		goto out;
+	}
+
+	rw = bio_rw(bio);
+	if (rw == READA)
+		rw = 0;
+
+	bio_for_each_segment(bvec, bio, i) {
+		unsigned int len = bvec->bv_len;
+		if (rw == 0) {
+			printk(KERN_WARNING "bs read ...\n");
+		} else {
+			printk(KERN_WARNING "bs write ...\n");
+		}
+
+		sector += len >> 9;
+	}
+out:
+	bio_endio(bio, err);
 	return 0;
 }
 
-static struct blocksimple_device *setup_device(unsigned int i)
+static struct bsd_device *bsd_alloc(unsigned int i)
 {
-	struct blocksimple_device *bsd;
+	struct bsd_device *bsd;
 	struct gendisk *disk;
 
 	bsd = kzalloc(sizeof *bsd, GFP_KERNEL);
 	if (!bsd) {
-		printk(KERN_ERR "%s: kzalloc failed\n", __func__);
+		printk(KERN_ERR "kzalloc bsd failed\n");
 		goto err_out_kzalloc;
 	}
 
-	bsd->number = i;
+	spin_lock_init(&bsd->lock);
+	INIT_RADIX_TREE(&bsd->pages, GFP_ATOMIC);
+
 	bsd->queue = blk_alloc_queue(GFP_KERNEL);
 	if (!bsd->queue) {
-		printk(KERN_ERR "%s: blk_alloc_queue failed\n", __func__);
+		printk(KERN_ERR "blk_alloc_queue failed\n");
 		goto err_out_queue;
 	}
 	blk_queue_make_request(bsd->queue, bsd_make_request);
 	blk_queue_max_hw_sectors(bsd->queue, 1024);
 	blk_queue_bounce_limit(bsd->queue, BLK_BOUNCE_ANY);
 
+	//bsd->queue->limits.discard_granularity = PAGE_SIZE;
+	//bsd->queue->limits.max_discard_sectors = UINT_MAX;
+	//bsd->queue->limits.discard_zeroes_data = 1;
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, bsd->queue);
 
-	disk = bsd->disk = alloc_disk(16);
+	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, bsd->queue);
+
+	disk = bsd->disk = alloc_disk(1<<part_shift);
 	if (!disk) {
-		printk(KERN_ERR "%s: alloc_disk(%u) failed\n",
-		       __func__, partinum);
+		printk(KERN_ERR "alloc_disk(%u) failed\n", max_part);
 		goto err_out_disk;
 	}
 	disk->major = major;
-	disk->first_minor = i<<4;
+	disk->first_minor = i<<part_shift;
 	disk->fops = &bsd_fops;
 	disk->private_data = bsd;
 	disk->queue = bsd->queue;
 	disk->flags = GENHD_FL_SUPPRESS_PARTITION_INFO;
 	sprintf(disk->disk_name, "blocksimple%u", i);
-	set_capacity(disk, 10240);
+	set_capacity(disk, size_bs * 2);
 
 	return bsd;
 
@@ -93,18 +144,84 @@ err_out_kzalloc:
 	return NULL;
 }
 
-static void free_device(struct blocksimple_device *dev)
+static void bsd_free(struct bsd_device *bsd)
 {
-	put_disk(dev->disk);
-	blk_cleanup_queue(dev->queue);
-	kfree(dev);
+	put_disk(bsd->disk);
+	blk_cleanup_queue(bsd->queue);
+	bsd_free_pages(bsd);
+	kfree(bsd);
+}
+
+static struct bsd_device *bsd_init_one(int i)
+{
+	struct bsd_device *bsd;
+
+	list_for_each_entry(bsd, &blocksimple_devices, list) {
+		if (bsd->disk->first_minor == (i << part_shift))
+			goto out;
+	}
+
+	bsd = bsd_alloc(i);
+	if (bsd) {
+		add_disk(bsd->disk);
+		list_add_tail(&bsd->list, &blocksimple_devices);
+	}
+out:
+	return bsd;
+}
+
+static void bsd_del_one(struct bsd_device *bsd)
+{
+	list_del(&bsd->list);
+	del_gendisk(bsd->disk);
+	bsd_free(bsd);
+}
+
+static struct kobject *bsd_probe(dev_t dev, int *part, void *data)
+{
+	struct bsd_device *bsd;
+	struct kobject *kobj;
+
+	mutex_lock(&blocksimple_devices_mutex);
+	bsd = bsd_init_one(MINOR(dev) >> part_shift);
+	kobj = bsd ? get_disk(bsd->disk) : ERR_PTR(-ENOMEM);
+	mutex_unlock(&blocksimple_devices_mutex);
+
+	*part = 0;
+	return kobj;
 }
 
 static int __init blocksimple_init(void)
 {
 	int err;
-	unsigned int i;
-	struct blocksimple_device *bsd, *next;
+	uint i, nr;
+	ulong range;
+	struct bsd_device *bsd, *next;
+
+	if (max_part) {
+		part_shift = fls(max_part);
+		max_part = (1UL << part_shift) - 1;
+	}
+
+	if (max_part > DISK_MAX_PARTS) {
+		printk(KERN_ERR "partitions num overflow (%u, %u)\n",
+		       max_part, DISK_MAX_PARTS);
+		return -EINVAL;
+	}
+
+	if (nr_bs > (1UL << (MINORBITS - part_shift))) {
+		printk(KERN_ERR "devices number overflow (%ul, %lu)\n",
+		       nr_bs, (1UL << (MINORBITS - part_shift)));
+		return -EINVAL;
+	}
+
+	if (nr_bs) {
+		nr = nr_bs;
+		range = nr_bs << part_shift;
+	} else {
+		nr = 4;
+		range = 1UL << MINORBITS;
+	}
 
 	if ((err = register_blkdev(major, NAME)) < 0) {
 		printk(KERN_ERR "register_blkdev(%d, %s) fail\n", major, NAME);
@@ -113,10 +230,10 @@ static int __init blocksimple_init(void)
 	if (!major)
 		major = err;
 
-	for (i = 0; i < devnum; ++i) {
-		bsd = setup_device(i);
+	for (i = 0; i < nr; ++i) {
+		bsd = bsd_alloc(i);
 		if (!bsd)
-			goto err_out_kzalloc;
+			goto err_out_setup;
 
 		list_add_tail(&bsd->list, &blocksimple_devices);
 	}
@@ -124,13 +241,16 @@ static int __init blocksimple_init(void)
 	list_for_each_entry(bsd, &blocksimple_devices, list)
 		add_disk(bsd->disk);
 
+	blk_register_region(MKDEV(major, 0), range,
+			    THIS_MODULE, bsd_probe, NULL, NULL);
+
 	printk(KERN_INFO "blocksimple initialized\n");
 	return 0;
 
-err_out_kzalloc:
+err_out_setup:
 	list_for_each_entry_safe(bsd, next, &blocksimple_devices, list) {
 		list_del(&bsd->list);
-		free_device(bsd);
+		bsd_free(bsd);
 	}
 	unregister_blkdev(major, NAME);
 
@@ -139,13 +259,14 @@ err_out_kzalloc:
 
 static void __exit blocksimple_exit(void)
 {
-	struct blocksimple_device *bsd, *next;
+	ulong range;
+	struct bsd_device *bsd, *next;
 
-	list_for_each_entry_safe(bsd, next, &blocksimple_devices, list) {
-		list_del(&bsd->list);
-		del_gendisk(bsd->disk);
-		free_device(bsd);
-	}
+	list_for_each_entry_safe(bsd, next, &blocksimple_devices, list)
+		bsd_del_one(bsd);
+
+	range = nr_bs ? nr_bs << part_shift : 1UL << MINORBITS;
+	blk_unregister_region(MKDEV(major, 0), range);
 	unregister_blkdev(major, NAME);
 	printk(KERN_INFO "blocksimple destroyed\n");
 }
