@@ -10,15 +10,19 @@
 #include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/blkdev.h>
+#include <linux/mutex.h>
 #include <linux/kdev_t.h>
 #include <linux/types.h>
 
 #define NAME	"blocksimple"
+#define SECTOR_SHIFT		9
+#define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+#define PAGE_SECTORS		(1<<PAGE_SECTORS_SHIFT)
 
 static uint major;
 static uint max_part = 16;
 static uint nr_bs;
-static uint size_bs;
+static uint size_bs = 16384;
 
 module_param(major, uint, S_IRUGO);
 MODULE_PARM_DESC(major, "blocksimple device major number");
@@ -42,21 +46,249 @@ struct bsd_device {
 
 static const struct block_device_operations bsd_fops = {
 	.owner = THIS_MODULE,
+#ifdef CONFIG_BLK_DEV_XIP
+	.direct_access = bsd_direct_access,
+#endif
 };
 
 static LIST_HEAD(blocksimple_devices);
 static DEFINE_MUTEX(blocksimple_devices_mutex);
 
+static DEFINE_MUTEX(bsd_mutex);
+static struct page *bsd_lookup_page(struct bsd_device *bsd, sector_t sector)
+{
+	pgoff_t idx;
+	struct page *page;
+
+	rcu_read_lock();
+	idx = sector >> PAGE_SECTORS_SHIFT;
+	page = radix_tree_lookup(&bsd->pages, idx);
+	rcu_read_unlock();
+
+	BUG_ON(page && page->index != idx);
+
+	return page;
+}
+
+static struct page *bsd_insert_page(struct bsd_device *bsd, sector_t sector)
+{
+	pgoff_t idx;
+	struct page *page;
+	gfp_t gfp_flags;
+
+	page = bsd_lookup_page(bsd, sector);
+	if (page)
+		return page;
+
+	gfp_flags = GFP_NOIO | __GFP_ZERO;
+#ifndef CONFIG_BLK_DEV_XIP
+	gfp_flags |= __GFP_HIGHMEM;
+#endif
+	page = alloc_page(gfp_flags);
+	if (!page)
+		return NULL;
+
+	if (radix_tree_preload(GFP_NOIO)) {
+		__free_page(page);
+		return NULL;
+	}
+
+	spin_lock(&bsd->lock);
+	idx = sector >> PAGE_SECTORS_SHIFT;
+	if (radix_tree_insert(&bsd->pages, idx, page)) {
+		__free_page(page);
+		page = radix_tree_lookup(&bsd->pages, idx);
+		BUG_ON(!page);
+		BUG_ON(page->index !=idx);
+	} else {
+		page->index = idx;
+	}
+	spin_unlock(&bsd->lock);
+
+	radix_tree_preload_end();
+
+	return page;
+}
+
+static void bsd_free_page(struct bsd_device *bsd, sector_t sector)
+{
+	struct page *page;
+	pgoff_t idx;
+
+	spin_lock(&bsd->lock);
+	idx = sector >> PAGE_SECTORS_SHIFT;
+	page = radix_tree_delete(&bsd->pages, idx);
+	spin_unlock(&bsd->lock);
+	if (page)
+		__free_page(page);
+}
+
+static void bsd_zero_page(struct bsd_device *bsd, sector_t sector)
+{
+	struct page *page;
+	page = bsd_lookup_page(bsd, sector);
+	if (page)
+		clear_highpage(page);
+}
+
+#define FREE_BATCH 16
 static void bsd_free_pages(struct bsd_device *bsd)
 {
+
+	ulong pos = 0;
+	struct page *pages[FREE_BATCH];
+
+	int nr_pages;
+
+	do {
+		uint i;
+
+		nr_pages = radix_tree_gang_lookup(&bsd->pages, (void**)pages,
+						  pos, FREE_BATCH);
+
+		for (i = 0; i < nr_pages; ++i) {
+			void *ret;
+
+			BUG_ON(pages[i]->index < pos);
+			pos = pages[i]->index;
+			ret = radix_tree_delete(&bsd->pages, pos);
+			BUG_ON(!ret || ret != pages[i]);
+			__free_page(pages[i]);
+		}
+
+		++pos;
+
+	} while (nr_pages == FREE_BATCH);
+}
+
+static int copy_to_bsd_setup(struct bsd_device *bsd, sector_t sector, size_t n)
+{
+	uint offset = (sector & (PAGE_SECTORS - 1)) << SECTOR_SHIFT;
+	size_t copy;
+
+	copy = min_t(size_t, n, PAGE_SIZE - offset);
+	if (!bsd_insert_page(bsd, sector))
+		return -ENOMEM;
+
+	if (copy < n) {
+		sector += copy >> SECTOR_SHIFT;
+		if (!bsd_insert_page(bsd, sector))
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void discard_from_bsd(struct bsd_device *bsd, sector_t sector, size_t n)
+{
+	while (n >= PAGE_SIZE) {
+		if (0)
+			bsd_free_page(bsd, sector);
+		else
+			bsd_zero_page(bsd, sector);
+		sector += PAGE_SIZE >> SECTOR_SHIFT;
+		n -= PAGE_SIZE;
+	}
+}
+
+static void copy_to_bsd(struct bsd_device *bsd, const void *src,
+			sector_t sector, size_t n)
+{
+	struct page *page;
+	void *dst;
+	uint offset = (sector & (PAGE_SECTORS - 1)) << SECTOR_SHIFT;
+	size_t copy;
+
+	copy = min_t(size_t, n, PAGE_SIZE - offset);
+	page = bsd_lookup_page(bsd, sector);
+	BUG_ON(!page);
+
+	dst = kmap_atomic(page, KM_USER1);
+	memcpy(dst + offset, src, copy);
+	kunmap_atomic(dst, KM_USER1);
+
+	if (copy < n) {
+		src += copy;
+		sector += copy >> SECTOR_SHIFT;
+		copy = n - copy;
+		page = bsd_lookup_page(bsd, sector);
+		BUG_ON(!page);
+
+		dst = kmap_atomic(page, KM_USER1);
+		memcpy(dst, src, copy);
+		kunmap_atomic(dst, KM_USER1);
+	}
+}
+
+static void copy_from_bsd(void *dst, struct bsd_device *bsd,
+			  sector_t sector, size_t n)
+{
+	struct page *page;
+	void *src;
+	uint offset = (sector & (PAGE_SECTORS-1)) << SECTOR_SHIFT;
+	size_t copy;
+
+	copy = min_t(size_t, n, PAGE_SIZE - offset);
+	page = bsd_lookup_page(bsd, sector);
+	if (page) {
+		src = kmap_atomic(page, KM_USER1);
+		memcpy(dst, src + offset, copy);
+		kunmap_atomic(src, KM_USER1);
+	} else {
+		memset(dst, 0, copy);
+	}
+
+	if (copy < n) {
+		dst += copy;
+		sector += copy >> SECTOR_SHIFT;
+		copy = n - copy;
+
+		page = bsd_lookup_page(bsd, sector);
+		if (page) {
+			src = kmap_atomic(page, KM_USER1);
+			memcpy(dst, src + offset, copy);
+			kunmap_atomic(src, KM_USER1);
+		} else {
+			memset(dst, 0, copy);
+		}
+	}
+}
+
+static int bsd_do_bvec(struct bsd_device *bsd, struct page *page,
+		       uint len, uint off, int rw, sector_t sector)
+{
+	void *mem;
+	int err = 0;
+
+	/* treat read-ahead as normal read */
+	if (rw == READA)
+		rw = READ;
+
+	if (rw != READ) {
+		err = copy_to_bsd_setup(bsd, sector, len);
+		if (err)
+			goto out;
+	}
+
+	mem = kmap_atomic(page, KM_USER0);
+	if (rw == READ) {
+		copy_from_bsd(mem+off, bsd, sector, len);
+		flush_dcache_page(page);
+	} else {
+		flush_dcache_page(page);
+		copy_to_bsd(bsd, mem + off, sector, len);
+	}
+	kunmap_atomic(mem, KM_USER0);
+
+out:
+	return err;
 }
 
 static int bsd_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct block_device *bdev = bio->bi_bdev;
-	//struct bsd_device *bsdev = bdev->bd_disk->private_data;
+	struct bsd_device *bsd = bdev->bd_disk->private_data;
 
-	int rw;
 	struct bio_vec *bvec;
 	sector_t sector;
 	int i;
@@ -68,20 +300,17 @@ static int bsd_make_request(struct request_queue *q, struct bio *bio)
 
 	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
 		err = 0;
+		discard_from_bsd(bsd, sector, bio->bi_size);
 		goto out;
 	}
 
-	rw = bio_rw(bio);
-	if (rw == READA)
-		rw = 0;
-
 	bio_for_each_segment(bvec, bio, i) {
-		unsigned int len = bvec->bv_len;
-		if (rw == 0) {
-			printk(KERN_WARNING "bs read ...\n");
-		} else {
-			printk(KERN_WARNING "bs write ...\n");
-		}
+		uint len = bvec->bv_len;
+
+		err = bsd_do_bvec(bsd, bvec->bv_page, len, bvec->bv_offset,
+				  bio_rw(bio), sector);
+		if (err)
+			break;
 
 		sector += len >> 9;
 	}
@@ -89,6 +318,33 @@ out:
 	bio_endio(bio, err);
 	return 0;
 }
+
+#ifdef CONFIG_BLK_DEV_XIP
+static int bsd_direct_access(struct block_device *bdev, sector_t sector,
+			     void *kaddr, ulong *pfn)
+{
+	struct bsd_device *bsd = bdev->bd_disk->private_data;
+	struct page *page;
+
+	if (!bsd)
+		return -ENODEV;
+
+	if (sector & (PAGE_SECTORS - 1))
+		return -EINVAL;
+
+	if (sector + PAGE_SECTORS > get_capacity(bdev->bd_disk))
+		return -ERANGE;
+
+	page = bsd_insert_page(bsd, sector);
+	if (!page)
+		return -ENOMEM;
+
+	*kaddr = page_address(page);
+	*pfn = page_to_pfn(page);
+
+	return 0;
+}
+#endif
 
 static struct bsd_device *bsd_alloc(unsigned int i)
 {
@@ -114,7 +370,7 @@ static struct bsd_device *bsd_alloc(unsigned int i)
 	blk_queue_bounce_limit(bsd->queue, BLK_BOUNCE_ANY);
 
 	//bsd->queue->limits.discard_granularity = PAGE_SIZE;
-	//bsd->queue->limits.max_discard_sectors = UINT_MAX;
+	bsd->queue->limits.max_discard_sectors = UINT_MAX;
 	//bsd->queue->limits.discard_zeroes_data = 1;
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, bsd->queue);
 
